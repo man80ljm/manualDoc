@@ -145,7 +145,7 @@ def create_document(structure, root_path, output_path, update_progress, update_s
     
     # Estimate title height
     title_height_in = (10.5 / 72) * 1.5  # Adjusted for 1.5 line spacing
-    scale_factor = 0.9  # Reduced for more margin
+    scale_factor = 0.95  # Reduced for more margin
     
     # Customize Heading styles
     styles = doc.styles
