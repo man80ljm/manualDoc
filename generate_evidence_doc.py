@@ -1,13 +1,23 @@
 import os
 import re
+import logging
 from pathlib import Path
-from tkinter import Tk, Button, filedialog, Label, messagebox
-from tkinter.ttk import Progressbar
+from concurrent.futures import ThreadPoolExecutor
+from tkinter import messagebox, filedialog
+import ttkbootstrap as ttk
+from ttkbootstrap.constants import *
+from ttkbootstrap.scrolled import ScrolledText
 from docx import Document
 from docx.shared import Inches, Cm, Pt
 from docx.enum.text import WD_ALIGN_PARAGRAPH
 from docx.oxml.ns import qn
 from PIL import Image
+
+# Configure logging
+logging.basicConfig(level=logging.INFO, filename='doc_generator.log', format='%(asctime)s - %(levelname)s - %(message)s')
+
+# Supported file extensions
+SUPPORTED_EXTENSIONS = {'.png', '.jpg', '.jpeg'}
 
 # Global variable to store the selected folder
 selected_folder = ""
@@ -38,38 +48,53 @@ def convert_folder_name(folder_name, level):
             return folder_name
     return folder_name
 
-def rename_images(folder_path, update_status):
-    """Recursively rename images in all folders to 1.jpg, 2.jpg, etc., preserving extension."""
+def check_unsupported_files(folder_path):
+    """Check for unsupported file types in the folder and return a list of them."""
+    unsupported_files = []
     for item in Path(folder_path).iterdir():
         if item.is_dir():
-            rename_images(item, update_status)
-        elif item.is_file() and item.suffix.lower() in ['.png', '.jpg', '.jpeg']:
-            images = [f for f in item.parent.iterdir() if f.suffix.lower() in ['.png', '.jpg', '.jpeg']]
-            images = sorted(images, key=lambda x: natural_sort_key(x.name))
-            for i, image in enumerate(images, 1):
-                new_name = item.parent / f"{i}{image.suffix.lower()}"
-                if image != new_name:
-                    if new_name.exists():
-                        update_status(f"Warning: {new_name} already exists, skipping rename for {image}")
-                        print(f"Warning: {new_name} already exists, skipping rename for {image}")
-                        continue
-                    try:
-                        image.rename(new_name)
-                        update_status(f"Renamed {image} to {new_name}")
-                        print(f"Renamed {image} to {new_name}")
-                    except Exception as e:
-                        update_status(f"Error renaming {image}: {e}")
-                        print(f"Error renaming {image}: {e}")
+            unsupported_files.extend(check_unsupported_files(item))
+        elif item.is_file() and item.suffix.lower() not in SUPPORTED_EXTENSIONS:
+            unsupported_files.append(str(item))
+    return unsupported_files
+
+def rename_image(image, new_name, update_status):
+    """Rename a single image file with error handling."""
+    try:
+        image.rename(new_name)
+        update_status(f"Renamed {image} to {new_name}", "success")
+        logging.info(f"Renamed {image} to {new_name}")
+    except Exception as e:
+        update_status(f"Error renaming {image}: {e}", "danger")
+        logging.error(f"Error renaming {image}: {e}")
+
+def rename_images(folder_path, update_status):
+    """Recursively rename images in all folders to 1.jpg, 2.jpg, etc., using threads."""
+    with ThreadPoolExecutor() as executor:
+        for item in Path(folder_path).iterdir():
+            if item.is_dir():
+                rename_images(item, update_status)
+            elif item.is_file() and item.suffix.lower() in SUPPORTED_EXTENSIONS:
+                try:
+                    images = [f for f in item.parent.iterdir() if f.suffix.lower() in SUPPORTED_EXTENSIONS]
+                    images = sorted(images, key=lambda x: natural_sort_key(x.name))
+                    for i, image in enumerate(images, 1):
+                        new_name = item.parent / f"{i}{image.suffix.lower()}"
+                        if image != new_name and not new_name.exists():
+                            executor.submit(rename_image, image, new_name, update_status)
+                except Exception as e:
+                    update_status(f"Error processing folder {item.parent}: {e}", "danger")
+                    logging.error(f"Error processing folder {item.parent}: {e}")
 
 def collect_files(folder_path, level=1):
-    """Recursively collect folder structure and files for any level."""
+    """Recursively collect folder structure and files for any level, only including supported files."""
     structure = []
     for item in sorted(Path(folder_path).iterdir(), key=lambda x: natural_sort_key(x.name)):
         if item.is_dir():
             subfolders = collect_files(item, level + 1)
             files = []
             for file in sorted(item.iterdir(), key=lambda x: natural_sort_key(x.name)):
-                if file.suffix.lower() in ['.png', '.jpg', '.jpeg']:
+                if file.suffix.lower() in SUPPORTED_EXTENSIONS:
                     files.append(file)
             if subfolders or files:
                 structure.append((item.name, files, subfolders))
@@ -85,18 +110,18 @@ def count_total_images(structure):
     return total
 
 def get_image_dimensions(image_path):
-    """Get the dimensions of an image using PIL."""
+    """Get the dimensions of an image using PIL with error handling."""
     try:
         with Image.open(image_path) as img:
             width, height = img.size
             return width, height
     except Exception as e:
-        print(f"Error getting image dimensions for {image_path}: {e}")
+        logging.error(f"Error getting image dimensions for {image_path}: {e}")
         return None, None
 
 def create_document(structure, root_path, output_path, update_progress, update_status):
     """Create Word document with content pages, supporting multiple levels."""
-    print(f"Creating document at: {output_path}")
+    logging.info(f"Creating document at: {output_path}")
     doc = Document()
     
     # Set page margins for all pages
@@ -113,18 +138,16 @@ def create_document(structure, root_path, output_path, update_progress, update_s
     page_width = 21  # cm (A4 width)
     page_height = 29.7  # cm (A4 height)
     margin = 1.27  # cm
-    available_width = page_width - 2 * margin  # cm
-    available_width_in = available_width / 2.54  # inches (18.46 cm / 2.54 ≈ 7.27 inches)
-    available_height = page_height - 2 * margin  # cm
-    available_height_in = available_height / 2.54  # inches (27.16 cm / 2.54 ≈ 10.69 inches)
+    available_width = page_width - 2 * margin
+    available_width_in = available_width / 2.54
+    available_height = page_height - 2 * margin
+    available_height_in = available_height / 2.54
     
-    # Estimate title height (assume 1 line per title, font size 10.5 pt, 1 pt = 1/72 inch)
-    title_height_in = (10.5 / 72) * 2  # Increased to 2 lines for safety
+    # Estimate title height
+    title_height_in = (10.5 / 72) * 1.5  # Adjusted for 1.5 line spacing
+    scale_factor = 0.9  # Reduced for more margin
     
-    # Scaling factor to leave some margin (95% of calculated size)
-    scale_factor = 0.95
-    
-    # Customize Heading 1 and Heading 2 styles
+    # Customize Heading styles
     styles = doc.styles
     style1 = styles['Heading 1']
     style1.font.name = 'SimSun'
@@ -147,6 +170,11 @@ def create_document(structure, root_path, output_path, update_progress, update_s
     style2.paragraph_format.alignment = WD_ALIGN_PARAGRAPH.JUSTIFY
     
     total_images = count_total_images(structure)
+    if total_images == 0:
+        update_status("没有找到任何支持的图片文件！", "danger")
+        logging.warning("No supported image files found")
+        return False
+    
     current_image = 0
     
     def add_headings(folder_structure, level=1, is_first_secondary=False):
@@ -163,61 +191,46 @@ def create_document(structure, root_path, output_path, update_progress, update_s
             run.bold = (level == 1)
             paragraph.alignment = WD_ALIGN_PARAGRAPH.JUSTIFY
             paragraph.style = f'Heading {level}'
-            # Ensure heading stays with the next content
             paragraph.paragraph_format.keep_with_next = True
             
-            # Add images if any
+            # Add images
             for file in files:
-                print(f"Adding image: {file}")
-                update_status(f"Adding image: {file}")
+                update_status(f"Adding image: {file}", "info")
+                logging.info(f"Adding image: {file}")
                 try:
-                    # Get image dimensions
                     img_width, img_height = get_image_dimensions(file)
                     if img_width is None or img_height is None:
-                        image_width = available_width_in * scale_factor
-                        image_height = None
-                    else:
-                        # Calculate aspect ratio
-                        aspect_ratio = img_width / img_height
-                        
-                        # Step 1: Try width-first (fit to page width)
-                        image_width = available_width_in
-                        image_height = image_width / aspect_ratio
-                        
-                        # Step 2: Check if height fits (including title height)
-                        total_height = image_height + title_height_in
-                        if total_height > available_height_in:
-                            # Step 3: Height-first (fit to page height)
-                            image_height = available_height_in - title_height_in
-                            image_width = image_height * aspect_ratio
-                            # Ensure width doesn't exceed page width
-                            if image_width > available_width_in:
-                                image_width = available_width_in
-                                image_height = image_width / aspect_ratio
-                        
-                        # Step 4: Apply scaling factor to leave margin
-                        image_width *= scale_factor
-                        image_height *= scale_factor
+                        update_status(f"Skipping {file}: Unable to read image dimensions", "danger")
+                        continue
+                    aspect_ratio = img_width / img_height
+                    image_width = available_width_in
+                    image_height = image_width / aspect_ratio
+                    total_height = image_height + title_height_in
+                    if total_height > available_height_in:
+                        image_height = available_height_in - title_height_in
+                        image_width = image_height * aspect_ratio
+                        if image_width > available_width_in:
+                            image_width = available_width_in
+                            image_height = image_width / aspect_ratio
+                    image_width *= scale_factor
+                    image_height *= scale_factor
                     
-                    # Add image with calculated dimensions
                     paragraph = doc.add_paragraph()
                     paragraph.alignment = WD_ALIGN_PARAGRAPH.CENTER
                     run = paragraph.add_run()
-                    if image_height:
-                        run.add_picture(str(file), width=Inches(image_width), height=Inches(image_height))
-                    else:
-                        run.add_picture(str(file), width=Inches(image_width))
+                    run.add_picture(str(file), width=Inches(image_width), height=Inches(image_height))
                     current_image += 1
                     update_progress(current_image / total_images * 100)
                 except Exception as e:
-                    print(f"Error adding image {file}: {e}")
+                    update_status(f"Error adding image {file}: {e}", "danger")
+                    logging.error(f"Error adding image {file}: {e}")
             
-            # Recursively add subfolders
+            # Add subfolders
             if subfolders:
                 if level > 1 and not is_first_secondary:
                     doc.add_page_break()
                 add_headings(subfolders, level + 1, is_first_secondary=(level == 1))
-
+    
     add_headings(structure)
     
     output_path_str = str(output_path)
@@ -226,79 +239,122 @@ def create_document(structure, root_path, output_path, update_progress, update_s
             with open(output_path_str, 'a') as f:
                 pass
         doc.save(output_path_str)
-        print(f"Document creation completed at: {output_path_str}")
-        update_status("文件创建完成！")
+        update_status("文件创建完成！", "success")
+        logging.info(f"Document creation completed at: {output_path_str}")
         return True
     except IOError:
-        messagebox.showwarning("Warning", "请关闭文件再导出！")
-        print("Failed to save: File is open or permission denied")
-        update_status("Failed to save: File is open or permission denied")
+        messagebox.showwarning("警告", "请关闭文件再导出！")
+        update_status("Failed to save: File is open or permission denied", "danger")
+        logging.error("Failed to save: File is open or permission denied")
         return False
 
-def main():
-    def select_folder():
-        global selected_folder
+class DocGeneratorApp:
+    def __init__(self):
+        self.root = ttk.Window(themename="flatly")
+        self.root.title("佐证材料生成")
+        self.root.geometry("500x350")
+        self.root.minsize(500, 350)
+        self.root.resizable(True, True)
+        try:
+            self.root.iconbitmap('manualDoc.ico')
+        except:
+            logging.warning("Failed to load manualDoc.ico")
+        
+        self.selected_folder = ""
+        self.setup_ui()
+    
+    def setup_ui(self):
+        frame = ttk.Frame(self.root)
+        frame.pack(pady=10, padx=10, fill="both", expand=True)
+        
+        self.label = ttk.Label(frame, text="没有选择文件夹!", bootstyle="info")
+        self.label.pack(pady=10)
+        
+        # Create a centered container for buttons
+        button_container = ttk.Frame(frame)
+        button_container.pack(expand=True, anchor="center")
+        
+        self.btn_select = ttk.Button(button_container, text="加载文件夹", command=self.select_folder, bootstyle="primary")
+        self.btn_select.pack(side="left", padx=5)
+        self.btn_generate = ttk.Button(button_container, text="生成文件", command=self.generate_doc, bootstyle="success")
+        self.btn_generate.pack(side="left", padx=5)
+        
+        self.progress_bar = ttk.Progressbar(frame, orient="horizontal", length=300, mode="determinate", bootstyle="striped")
+        self.progress_bar.pack(pady=10, fill="x", padx=20)
+        
+        self.status_text = ScrolledText(frame, height=5, wrap="word", autohide=True)
+        self.status_text.pack(pady=5, padx=10, fill="both")
+        self.status_text.tag_config("success", foreground="green")
+        self.status_text.tag_config("danger", foreground="red")
+        self.status_text.tag_config("info", foreground="blue")
+    
+    def select_folder(self):
         folder_path = filedialog.askdirectory()
         if folder_path:
-            selected_folder = folder_path
-            label.config(text=f"Selected: {folder_path}")
-            print(f"Folder selected: {selected_folder}")
+            self.selected_folder = folder_path
+            self.label.config(text=f"已选择: {folder_path}")
+            self.update_status(f"已选择文件夹: {folder_path}", "info")
+            logging.info(f"Folder selected: {self.selected_folder}")
         else:
-            label.config(text="没有选择文件夹!")
-            print("没有选择文件夹!")
-
-    def generate_doc():
-        if not selected_folder:
-            label.config(text="请选择文件夹！")
-            print("没有选择文件夹!")
+            self.label.config(text="没有选择文件夹!")
+            self.update_status("没有选择文件夹!", "danger")
+            logging.warning("No folder selected")
+    
+    def update_status(self, text, style="info"):
+        self.status_text.insert("end", f"{text}\n", style)
+        self.status_text.see("end")
+        self.root.update()
+    
+    def generate_doc(self):
+        if not self.selected_folder:
+            self.label.config(text="请选择文件夹！")
+            self.update_status("请选择文件夹！", "danger")
+            logging.warning("No folder selected for generation")
             return
+        
+        # Check for unsupported files
+        unsupported_files = check_unsupported_files(self.selected_folder)
+        if unsupported_files:
+            unsupported_list = "\n".join(unsupported_files[:5])  # Show up to 5 files
+            if len(unsupported_files) > 5:
+                unsupported_list += "\n... (更多文件未显示)"
+            messagebox.showwarning(
+                "警告",
+                f"检测到不支持的文件类型：\n{unsupported_list}\n"
+                "程序只支持图片文件（.png, .jpg, .jpeg），请移除或转换后重试！"
+            )
+            self.update_status("检测到不支持的文件类型，请检查警告信息！", "danger")
+        
         try:
             if messagebox.askyesno("确认重命名", "是否要将所有图片重命名为 1.jpg, 2.jpg 等？此操作不可逆！"):
-                status_label.config(text="正在重命名图片...")
-                root.update()
-                rename_images(selected_folder, lambda text: status_label.config(text=text) or root.update())
-                status_label.config(text="图片重命名完成！")
+                self.update_status("正在重命名图片...", "info")
+                rename_images(self.selected_folder, self.update_status)
+                self.update_status("图片重命名完成！", "success")
             
-            structure = collect_files(selected_folder)
+            structure = collect_files(self.selected_folder)
             if not structure:
-                messagebox.showerror("Error", "No valid files or folders found! Please check the folder structure.")
+                messagebox.showerror("错误", "未找到有效文件或文件夹！请检查文件夹结构。")
+                self.update_status("未找到有效文件或文件夹！", "danger")
                 return
-            output_path = Path(selected_folder) / "佐证材料.docx"
-            progress_bar['value'] = 0
-            status_label.config(text="Starting document generation...")
-            root.update()
-            success = create_document(structure, selected_folder, output_path, 
-                                     lambda value: progress_bar.__setitem__('value', value) or root.update(),
-                                     lambda text: status_label.config(text=text) or root.update())
+            output_path = Path(self.selected_folder) / "佐证材料.docx"
+            self.progress_bar['value'] = 0
+            self.update_status("开始生成文档...", "info")
+            success = create_document(structure, self.selected_folder, output_path, 
+                                     lambda value: self.progress_bar.__setitem__('value', value) or self.root.update(),
+                                     self.update_status)
             if success:
-                label.config(text=f"文件生成位置: {output_path}")
-                messagebox.showinfo("Success", f"Document generated at: {output_path}")
+                self.label.config(text=f"文件生成位置: {output_path}")
+                messagebox.showinfo("成功", f"文档已生成: {output_path}")
+                self.update_status(f"文档已生成: {output_path}", "success")
         except Exception as e:
-            print(f"Unexpected error: {e}")
+            logging.error(f"Unexpected error: {e}")
             if "Permission denied" not in str(e):
-                messagebox.showerror("Error", f"Failed to generate document: {str(e)}")
-            status_label.config(text=f"Error: {str(e)}")
-
-    root = Tk()
-    root.title("佐证材料生成")
-    root.geometry("400x250")
+                messagebox.showerror("错误", f"生成文档失败: {str(e)}")
+            self.update_status(f"错误: {str(e)}", "danger")
     
-    label = Label(root, text="没有选择文件夹!")
-    label.pack(pady=20)
-    
-    btn_select = Button(root, text="加载文件夹", command=select_folder)
-    btn_select.pack(pady=10)
-    
-    btn_generate = Button(root, text="生成文件", command=generate_doc)
-    btn_generate.pack(pady=10)
-    
-    progress_bar = Progressbar(root, orient="horizontal", length=300, mode="determinate")
-    progress_bar.pack(pady=5)
-    
-    status_label = Label(root, text="", wraplength=350)
-    status_label.pack(pady=5)
-    
-    root.mainloop()
+    def run(self):
+        self.root.mainloop()
 
 if __name__ == "__main__":
-    main()
+    app = DocGeneratorApp()
+    app.run()
